@@ -1,113 +1,118 @@
-import os
 import time
-import json
-import hashlib
 import threading
-from bs4 import BeautifulSoup
-import requests
 from flask import Flask, send_file
+from requests_html import HTMLSession
+from datetime import datetime
 
 app = Flask(__name__)
+session = HTMLSession()
 
-URL = "https://www.pokeguardian.com/articles/news-archive"
-HEADERS = {"User-Agent": "Mozilla/5.0"}
-SENT_HASHES = set()
-FIRST_RUN = not os.path.exists("first_run.flag")
+NEWS_FILE = "news.html"
+KEYWORDS = [
+    "card", "cards", "pokémon card", "expansion", "booster", "set", "deck",
+    "TCG", "trading card", "promo", "Rocket", "Prismatiche", "Terastal",
+    "Rivali", "Predestinati", "Destined", "Rivals"
+]
 
-def hash_news(title):
-    return hashlib.md5(title.encode("utf-8")).hexdigest()
-
-def fetch_news():
+# Funzione di scraping per un sito
+def fetch_site(url, source_name, container_selector, title_selector, link_selector):
+    print(f"🔍 Scansione {source_name}...")
+    results = []
     try:
-        res = requests.get(URL, headers=HEADERS)
-        soup = BeautifulSoup(res.text, "html.parser")
-        news_blocks = soup.select(".sqs-block-content h3")
-        links = soup.select(".sqs-block-content h3 a")
-        
-        news_items = []
-        for h3, a in zip(news_blocks, links):
-            title = h3.text.strip()
-            link = a["href"]
+        r = session.get(url)
+        r.html.render(timeout=20, sleep=2)
+        elements = r.html.find(container_selector)
+        for el in elements[:10]:  # controlliamo i primi 10 per sicurezza
+            title_el = el.find(title_selector, first=True)
+            link_el = el.find(link_selector, first=True)
+
+            if not title_el or not link_el:
+                continue
+
+            title = title_el.text.strip()
+            link = link_el.attrs.get("href", "").strip()
+
+            if not title or not link:
+                continue
+
             if not link.startswith("http"):
-                link = "https://www.pokeguardian.com" + link
-            news_items.append((title, link))
-        return news_items
+                link = url.rstrip("/") + "/" + link.lstrip("/")
+
+            if any(k.lower() in title.lower() for k in KEYWORDS):
+                results.append({
+                    "title": title,
+                    "link": link,
+                    "source": source_name
+                })
+
+            if len(results) >= 3:
+                break
+
     except Exception as e:
-        print("⚠️ Errore nel recupero delle news:", e)
-        return []
+        print(f"⚠️ Errore durante lo scraping di {source_name}: {e}")
+    return results
 
-def save_as_html(news_list):
-    with open("news.html", "w", encoding="utf-8") as f:
-        f.write("""<!DOCTYPE html>
-<html lang="it">
-<head>
-  <meta charset="UTF-8">
-  <title>Ultime News Pokémon</title>
-  <style>
-    body { font-family: sans-serif; padding: 20px; background: #fafafa; }
-    h1 { color: #006cff; }
-    .news { margin-bottom: 20px; }
-    .news a { color: #222; text-decoration: none; font-weight: bold; }
-    .news a:hover { text-decoration: underline; }
-    .news em { font-size: 0.9em; color: gray; }
-  </style>
-</head>
-<body>
-  <h1>📰 Ultime News da PokéGuardian</h1>
-""")
-        for item in news_list:
-            f.write(f"""<div class="news">
-  <a href="{item['link']}" target="_blank">{item['title']}</a><br>
-  <em>Fonte: PokéGuardian</em>
-</div>\n""")
+# Funzione principale
+def fetch_all_news():
+    all_news = []
+
+    all_news += fetch_site(
+        "https://www.pokeguardian.com/articles/news-archive",
+        "PokeGuardian",
+        ".article-container",
+        ".article-title", ".article-title a"
+    )
+
+    all_news += fetch_site(
+        "https://www.pokebeach.com/news",
+        "PokeBeach",
+        ".post", "h2", "h2 a"
+    )
+
+    all_news += fetch_site(
+        "https://www.pokemon.com/us/pokemon-news/",
+        "Pokemon USA",
+        ".news-article", ".news-article-title", "a"
+    )
+
+    all_news += fetch_site(
+        "https://www.pokemon.co.jp/info/cat_card/",
+        "Pokemon Japan",
+        ".news-list__element", ".news-list__title", "a"
+    )
+
+    return all_news[:12]  # massimo 3 news per 4 fonti
+
+# Genera l'HTML finale
+def save_news_html(news):
+    with open(NEWS_FILE, "w", encoding="utf-8") as f:
+        f.write("<html><head><meta charset='UTF-8'><title>News Pokémon TCG</title></head><body>")
+        f.write("<h1>Ultime notizie carte Pokémon</h1><ul>")
+        for item in news:
+            f.write(f"<li><strong>{item['source']}</strong>: <a href='{item['link']}' target='_blank'>{item['title']}</a></li>")
+        f.write("</ul><p>Aggiornato: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "</p>")
         f.write("</body></html>")
+    print("✅ File news.html aggiornato!")
 
-def save_as_json(news_list):
-    with open("news.json", "w", encoding="utf-8") as f:
-        json.dump(news_list, f, ensure_ascii=False, indent=2)
-
+# Thread scraping continuo
 def run_scraper():
-    global FIRST_RUN
     while True:
-        print("🔎 Avvio scraping...\n")
-        news = fetch_news()
-        to_send = []
-
-        if FIRST_RUN:
-            print("🚀 Prima esecuzione: salvo prime 4 news.")
-            for title, link in news[:4]:
-                h = hash_news(title)
-                if h not in SENT_HASHES:
-                    to_send.append({"title": title, "link": link})
-                    SENT_HASHES.add(h)
-            with open("first_run.flag", "w") as f:
-                f.write("done")
-            FIRST_RUN = False
+        print("🔄 Avvio scraping globale...")
+        all_news = fetch_all_news()
+        if all_news:
+            save_news_html(all_news)
         else:
-            for title, link in news:
-                h = hash_news(title)
-                if h not in SENT_HASHES:
-                    if any(k in title.lower() for k in ["scarlet", "violet", "booster", "promo", "rocket", "destined", "rivals", "terastal"]):
-                        to_send.append({"title": title, "link": link})
-                        SENT_HASHES.add(h)
+            print("⚠️ Nessuna news valida trovata.")
+        time.sleep(300)  # 5 minuti
 
-        if to_send:
-            print(f"📤 Salvate {len(to_send)} news nuove.")
-            save_as_html(to_send)
-            save_as_json(to_send)
-        else:
-            print("⏸ Nessuna nuova notizia da salvare.")
-        print("⏳ Attesa 1 minuto...\n")
-        time.sleep(60)
-
+# Flask
 @app.route("/")
 def index():
-    return send_file("news.html")
+    return send_file(NEWS_FILE)
 
-@app.route("/news.json")
-def json_news():
-    return send_file("news.json")
-
+# Avvia thread scraping
 if __name__ == "__main__":
-    threading.Thread(target=run_scraper).start()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    t = threading.Thread(target=run_scraper)
+    t.daemon = True
+    t.start()
+    app.run(host="0.0.0.0", port=10000)
